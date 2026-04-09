@@ -1,81 +1,133 @@
 # crypto-trends
-A minimal application that follows crypto prices regularly and monitors sudden changes.
 
-## What’s implemented (collector slice)
-This repo currently implements the **Collector** part of the planned architecture (`ARCHITECTURE.md`):
-- Fetches **batch** prices for a configured list of coins from a **public API** (CoinGecko).
-- Stores each batch into a **DuckDB warehouse file** (not SQLite) as an append-only **bronze** table: `bronze_price_ticks`.
-- Runs locally via **Docker**.
+A minimal application that follows crypto prices regularly, stores them in **DuckDB** (not SQLite), builds **silver/gold** analytics, monitors **price drops**, and publishes a **Streamlit** dashboard with charts and an architecture diagram.
 
-## Data source
-- **Provider**: CoinGecko API (no API key required for basic usage).
-- **Endpoint used**: `/simple/price` with `include_last_updated_at=true`.
+See `ARCHITECTURE.md` for the full design. Assignment brief: `TASK.md`.
+
+## Architecture (short)
+
+```mermaid
+flowchart LR
+  api[(CoinGecko_API)] --> collector[Collector]
+  collector --> bronze[(DuckDB_bronze)]
+  bronze --> processor[Processor]
+  processor --> silver_gold[(DuckDB_silver_gold)]
+  silver_gold --> alerter[Alerter]
+  alerter --> alerts[(alerts_table)]
+  silver_gold --> ui[Streamlit_UI]
+  alerts --> ui
+```
+
+## Services
+
+| Service | Role |
+|--------|------|
+| **collector** | First run on an **empty** warehouse backfills **~24h** of prices per coin via `market_chart`, then **downsamples to 15-minute buckets** (last price in each window). Later runs append **current** snapshots (`/simple/price`). Optional loop via `COLLECTOR_INTERVAL_SECONDS`. |
+| **processor** | Bronze → `silver_price_ticks` → `gold_*` tables (latest, returns, trends, snapshot). |
+| **alerter** | Inserts into `alerts_price_drops` when latest tick drops vs prior by ≥ threshold. |
+| **ui** | Streamlit app: multi-coin **line charts**, MA7 view, alerts, **Mermaid** architecture tab. |
 
 ## DuckDB warehouse
-- **File**: `data/warehouse.duckdb` (created on first run)
-- **Table**: `bronze_price_ticks`
-- **Schema**:
-  - `ingested_at` (TIMESTAMP, not null)
-  - `provider` (VARCHAR, not null)
-  - `request_id` (VARCHAR, not null) — UUID per batch run
-  - `coin_id` (VARCHAR, not null)
-  - `symbol` (VARCHAR, nullable)
-  - `currency` (VARCHAR, not null)
-  - `price` (DOUBLE, not null)
-  - `asof_ts` (TIMESTAMP, nullable) — provider timestamp if available, else `ingested_at`
 
-### Ingestion-time validations
-- `coin_id` must be present
-- `price` must be numeric and \( \ge 0 \)
+Default path: `data/warehouse.duckdb` (host) or `/data/warehouse.duckdb` (containers).
 
-## Configuration
-Set these environment variables (Docker examples below):
-- `COINS`: comma-separated list of coin IDs, optionally with symbol mapping.
-  - Example: `bitcoin:btc,ethereum:eth,solana:sol`
-  - Example: `bitcoin,ethereum` (symbol defaults to id)
-- `VS_CURRENCY`: quote currency, default `usd`
-- `DUCKDB_PATH`: DuckDB file path, default `/data/warehouse.duckdb` in the container
-- `COINGECKO_BASE_URL`: default `https://api.coingecko.com/api/v3`
+**Main tables**
 
-## Run (Docker Compose)
-From the `crypto-trends/` directory:
+- `bronze_price_ticks` — append-only raw ticks  
+- `silver_price_ticks` — deduped on `(provider, coin_id, asof_ts)`  
+- `gold_latest_prices`, `gold_returns`, `gold_trends`, `gold_market_summary`  
+- `alerts_price_drops`  
+
+## Configuration (env)
+
+Shared:
+
+- `DUCKDB_PATH` — path to DuckDB file  
+- `COINS` — e.g. `bitcoin:btc,ethereum:eth,solana:sol`  
+- `VS_CURRENCY` — default `usd`  
+
+Collector:
+
+- `COLLECTOR_INTERVAL_SECONDS` — if `> 0`, collector loops (default `0` = one shot)  
+- `COINGECKO_BASE_URL` — default `https://api.coingecko.com/api/v3`  
+- **Initial load (bronze row count = 0)**: uses `GET /coins/{id}/market_chart` with `INITIAL_BACKFILL_DAYS` (default **`1`** ≈ last **24 hours** rolling), then buckets points with **`INITIAL_BACKFILL_INTERVAL_MINUTES`** (default **`15`**). One HTTP call per coin, with a short delay between coins for rate limits.  
+- `SKIP_INITIAL_BACKFILL` — if `true` / `1` / `yes`, skip the chart backfill and use `/simple/price` even on first run.  
+
+**Charts show flat zeros?** Delete `data/warehouse.duckdb` (or your `DUCKDB_PATH`) and restart the stack so the collector runs the initial backfill again with the latest code; the Streamlit chart also reads **deduped bronze** if silver is empty, and normalizes timestamps so `st.line_chart` displays non-zero prices reliably.  
+
+Alerter:
+
+- `ALERT_DROP_THRESHOLD_PCT` — e.g. `5` (percent vs **prior tick**)  
+
+## Run locally (Docker Compose)
+
+Requires Docker. From this directory:
 
 ```bash
 mkdir -p data
 docker compose up --build
 ```
 
-You should see a summary like:
-- rows appended
-- DuckDB path
-- total rows in `bronze_price_ticks`
+- **Dashboard**: http://localhost:8501  
+- Warehouse file on host: `data/warehouse.duckdb`  
 
-### If Docker isn’t installed (or you’re on WSL without Docker integration)
-You can run the collector locally using `uv`:
+Compose runs **collector** on an interval, **processor** and **alerter** in loops, and **Streamlit** bound to `0.0.0.0:8501`.
+
+## Run locally (uv, no Docker)
 
 ```bash
 mkdir -p data
 uv venv
 . .venv/bin/activate
 uv pip install -r requirements.txt
-COINS="bitcoin:btc,ethereum:eth,solana:sol" DUCKDB_PATH="./data/warehouse.duckdb" python services/collector/app.py
 ```
 
-## Inspect the warehouse
-Option A: DuckDB CLI (if installed locally):
+Bootstrap warehouse (one collector run), then process and optionally alert:
 
 ```bash
-duckdb data/warehouse.duckdb "select * from bronze_price_ticks order by ingested_at desc limit 10;"
+export DUCKDB_PATH=./data/warehouse.duckdb
+export COINS="bitcoin:btc,ethereum:eth,solana:sol"
+python services/collector/app.py
+python services/processor/app.py
+python services/alerter/app.py
+streamlit run services/ui/app.py --server.port 8501 --server.address 127.0.0.1
 ```
 
-Option B: Python one-liner:
+For a **polling collector** (e.g. every 90s):
+
+```bash
+COLLECTOR_INTERVAL_SECONDS=90 python services/collector/app.py
+```
+
+## Public deployment (Streamlit)
+
+To make the **dashboard** reachable on the internet, the usual low-friction option is **[Streamlit Community Cloud](https://streamlit.io/cloud)**:
+
+1. Push this repo to GitHub.  
+2. Create a new app → point **Main file** to `services/ui/app.py`, Python 3.12+.  
+3. Set app **Secrets** / environment variables to match your coins, e.g.  
+   `COINS=bitcoin:btc,ethereum:eth` and `DUCKDB_PATH` if you mount storage.  
+
+**Important:** Cloud hosts do not share a persistent disk with your Docker stack. Without extra storage, the UI will still load but historical **DuckDB** charts may be empty until you:
+
+- run the collector elsewhere and **sync** the `.duckdb` file (S3, etc.), or  
+- use a **hosted DuckDB** path (e.g. MotherDuck) and point `DUCKDB_PATH` / connection there later, or  
+- rely on the app’s **live CoinGecko snapshot** (bar chart) when the warehouse is missing.
+
+For a **single VPS** (DigitalOcean, Hetzner, EC2, etc.), run the same `docker compose up -d` and open port **8501** in the firewall; bind to `0.0.0.0` is already set for Streamlit in Compose and `.streamlit/config.toml`.
+
+## Inspect the warehouse
+
+```bash
+duckdb data/warehouse.duckdb "SELECT * FROM silver_price_ticks ORDER BY asof_ts DESC LIMIT 10;"
+```
 
 ```bash
 python -c "import duckdb; con=duckdb.connect('data/warehouse.duckdb'); print(con.execute('select count(*) from bronze_price_ticks').fetchone()[0])"
 ```
 
-## Decisions / rationale
-- **DuckDB**: satisfies “not SQLite”, is file-based, fast, and easy to ship in Docker; aligns with your `ceu/ds-2` patterns.
-- **Bronze table first**: preserves raw-ish ingested data and makes later silver/gold processing reproducible.
-- **CoinGecko**: simplest public crypto price API for demos (no key); kept behind a small client so it can be swapped later.
+## Rationale (brief)
 
+- **DuckDB**: assignment asks to avoid SQLite; DuckDB is analyst-friendly and matches CEU `ds-2` bronze/silver/gold patterns.  
+- **Microservices**: collector / processor / alerter / UI are separate processes (Compose services).  
+- **CoinGecko**: public, keyless demo API; client is isolated for swapping providers.  

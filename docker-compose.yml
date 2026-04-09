@@ -1,11 +1,66 @@
 services:
   collector:
     build: .
+    command: ["python", "services/collector/app.py"]
     environment:
       PROVIDER: coingecko
       VS_CURRENCY: usd
       COINS: bitcoin:btc,ethereum:eth,solana:sol
       DUCKDB_PATH: /data/warehouse.duckdb
+      COLLECTOR_INTERVAL_SECONDS: "90"
+      INITIAL_BACKFILL_INTERVAL_MINUTES: "15"
     volumes:
       - ./data:/data
 
+  processor:
+    build: .
+    command:
+      [
+        "sh",
+        "-c",
+        'while true; do python services/processor/app.py || true; sleep 30; done',
+      ]
+    environment:
+      DUCKDB_PATH: /data/warehouse.duckdb
+    volumes:
+      - ./data:/data
+    depends_on:
+      - collector
+
+  alerter:
+    build: .
+    command:
+      [
+        "sh",
+        "-c",
+        'while true; do python services/alerter/app.py || true; sleep 35; done',
+      ]
+    environment:
+      DUCKDB_PATH: /data/warehouse.duckdb
+      ALERT_DROP_THRESHOLD_PCT: "5"
+    volumes:
+      - ./data:/data
+    depends_on:
+      - processor
+
+  ui:
+    build: .
+    command:
+      [
+        "streamlit",
+        "run",
+        "services/ui/app.py",
+        "--server.port=8501",
+        "--server.address=0.0.0.0",
+      ]
+    environment:
+      DUCKDB_PATH: /data/warehouse.duckdb
+      COINS: bitcoin:btc,ethereum:eth,solana:sol
+      VS_CURRENCY: usd
+    ports:
+      - "8501:8501"
+    volumes:
+      - ./data:/data
+    depends_on:
+      - collector
+      - processor

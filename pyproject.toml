@@ -3,5 +3,10 @@ name = "crypto-trends"
 version = "0.1.0"
 description = "A minimal application that follows crypto prices regularly and monitors sudden changes."
 readme = "README.md"
-requires-python = ">=3.13"
-dependencies = []
+requires-python = ">=3.12"
+dependencies = [
+    "duckdb>=0.10.0",
+    "requests>=2.32.5",
+    "pandas>=2.2.0",
+    "streamlit>=1.40.0",
+]

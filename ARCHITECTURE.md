@@ -18,7 +18,11 @@ This document captures the end-state architecture for the `crypto-trends` assign
 ## Assumptions (defaults)
 - **API provider**: CoinGecko (no API key) as default provider; keep an interface so it’s swappable.
 - **Alerts destination**: persist alerts in DuckDB and show them in the UI; can extend to webhook/email later.
-- **Local-first**: Docker compose runs everything locally; cloud deploy described in README only.
+- **Local-first**: Docker compose runs everything locally; public access is via exposing Streamlit (see below).
+
+## Public access
+- **Recommended for demos**: deploy **Streamlit** (`services/ui/app.py`) to **Streamlit Community Cloud** or run **`docker compose`** on a small VPS and open port **8501**.
+- **Caveat**: managed Streamlit hosts usually do **not** persist the on-disk DuckDB file across runs unless you attach external storage or a hosted warehouse. Until then, the UI can still show a **live** CoinGecko snapshot when tables are empty; history requires running the **collector + processor** on a schedule somewhere that writes the same `warehouse.duckdb` (or switching to a remote DuckDB/MotherDuck URI later).
 
 ## High-level architecture
 

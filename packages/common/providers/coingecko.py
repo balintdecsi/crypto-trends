@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any
 
 import requests
@@ -71,4 +72,41 @@ class CoinGeckoClient:
             )
 
         return quotes
+
+    def fetch_market_chart_prices(
+        self,
+        *,
+        coin_id: str,
+        vs_currency: str,
+        days: int = 1,
+    ) -> list[tuple[datetime, float]]:
+        """
+        Historical prices for the last `days` days (e.g. days=1 ≈ last 24 hours rolling).
+        CoinGecko: GET /coins/{id}/market_chart
+        """
+        url = f"{self._base_url}/coins/{coin_id}/market_chart"
+        params = {"vs_currency": vs_currency, "days": days}
+        resp = requests.get(url, params=params, timeout=self._timeout_s)
+        resp.raise_for_status()
+        payload: dict[str, Any] = resp.json()
+        raw_prices = payload.get("prices")
+        if not isinstance(raw_prices, list):
+            return []
+
+        out: list[tuple[datetime, float]] = []
+        for pt in raw_prices:
+            if not isinstance(pt, list) or len(pt) < 2:
+                continue
+            ms, price_raw = pt[0], pt[1]
+            try:
+                ts = datetime.fromtimestamp(float(ms) / 1000.0, tz=timezone.utc).replace(
+                    microsecond=0
+                )
+                price = float(price_raw)
+            except (TypeError, ValueError, OSError):
+                continue
+            if price < 0:
+                continue
+            out.append((ts, price))
+        return out
 
