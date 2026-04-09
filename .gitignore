@@ -191,6 +191,10 @@ cython_debug/
 # Ruff stuff:
 .ruff_cache/
 
+# Local warehouse / run artifacts
+data/*.duckdb
+data/*.wal
+
 # PyPI configuration file
 .pypirc
 
