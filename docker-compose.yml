@@ -1,0 +1,11 @@
+services:
+  collector:
+    build: .
+    environment:
+      PROVIDER: coingecko
+      VS_CURRENCY: usd
+      COINS: bitcoin:btc,ethereum:eth,solana:sol
+      DUCKDB_PATH: /data/warehouse.duckdb
+    volumes:
+      - ./data:/data
+
