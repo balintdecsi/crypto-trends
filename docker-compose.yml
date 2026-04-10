@@ -5,7 +5,7 @@ services:
     environment:
       PROVIDER: coingecko
       VS_CURRENCY: usd
-      COINS: bitcoin:btc,ethereum:eth,solana:sol
+      COINS: bitcoin:btc,ethereum:eth,solana:sol,cardano:ada
       DUCKDB_PATH: /data/warehouse.duckdb
       COLLECTOR_INTERVAL_SECONDS: "90"
       INITIAL_BACKFILL_INTERVAL_MINUTES: "15"
@@ -55,7 +55,7 @@ services:
       ]
     environment:
       DUCKDB_PATH: /data/warehouse.duckdb
-      COINS: bitcoin:btc,ethereum:eth,solana:sol
+      COINS: bitcoin:btc,ethereum:eth,solana:sol,cardano:ada
       VS_CURRENCY: usd
     ports:
       - "8501:8501"

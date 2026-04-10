@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import json
 import os
 import sys
+import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 
 import duckdb
+import altair as alt
 import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
@@ -22,6 +26,37 @@ from packages.common.db import (  # noqa: E402
     SILVER_TICKS_TABLE,
 )
 from packages.common.providers.coingecko import CoinGeckoClient  # noqa: E402
+
+
+def _debug_log(hypothesis_id: str, location: str, message: str, data: dict) -> None:
+    # region agent log
+    try:
+        log_path = "/home/balintdecsi/repos/.cursor/debug-babcd5.log"
+        Path(log_path).parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "sessionId": "babcd5",
+            "runId": "ui-pre-fix",
+            "hypothesisId": hypothesis_id,
+            "location": location,
+            "message": message,
+            "data": data,
+            "timestamp": int(datetime.now(timezone.utc).timestamp() * 1000),
+            "id": f"log_{uuid.uuid4().hex[:12]}",
+        }
+        line = json.dumps(payload, separators=(",", ":")) + "\n"
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(line)
+        # Also write to mounted data path for dockerized runs.
+        for extra_path in ("/data/debug-babcd5.log", "data/debug-babcd5.log"):
+            try:
+                Path(extra_path).parent.mkdir(parents=True, exist_ok=True)
+                with open(extra_path, "a", encoding="utf-8") as ef:
+                    ef.write(line)
+            except Exception:
+                pass
+    except Exception:
+        pass
+    # endregion
 
 
 def _warehouse_path() -> str:
@@ -49,8 +84,20 @@ def _load_price_history_for_chart(path: str) -> pd.DataFrame | None:
         f"SELECT coin_id, asof_ts, price FROM {SILVER_TICKS_TABLE} ORDER BY asof_ts, coin_id",
     )
     if silver is not None and not silver.empty:
+        # region agent log
+        _debug_log(
+            "H1",
+            "services/ui/app.py:_load_price_history_for_chart",
+            "using_silver_history",
+            {
+                "rows": int(len(silver)),
+                "coins": int(silver["coin_id"].nunique()) if "coin_id" in silver else -1,
+                "asof_distinct": int(silver["asof_ts"].nunique()) if "asof_ts" in silver else -1,
+            },
+        )
+        # endregion
         return silver
-    return _read_sql(
+    bronze = _read_sql(
         path,
         f"""
         WITH ranked AS (
@@ -70,6 +117,19 @@ def _load_price_history_for_chart(path: str) -> pd.DataFrame | None:
         ORDER BY asof_ts, coin_id
         """,
     )
+    # region agent log
+    _debug_log(
+        "H1",
+        "services/ui/app.py:_load_price_history_for_chart",
+        "using_bronze_fallback_history",
+        {
+            "rows": int(len(bronze)) if bronze is not None else -1,
+            "coins": int(bronze["coin_id"].nunique()) if bronze is not None and "coin_id" in bronze else -1,
+            "asof_distinct": int(bronze["asof_ts"].nunique()) if bronze is not None and "asof_ts" in bronze else -1,
+        },
+    )
+    # endregion
+    return bronze
 
 
 def _prepare_line_chart_wide(df: pd.DataFrame) -> pd.DataFrame:
@@ -78,6 +138,18 @@ def _prepare_line_chart_wide(df: pd.DataFrame) -> pd.DataFrame:
     are plain floats and the time index is UTC-na (wall-clock) for the chart API.
     """
     out = df.copy()
+    # region agent log
+    _debug_log(
+        "H2",
+        "services/ui/app.py:_prepare_line_chart_wide",
+        "input_to_prepare_line_chart",
+        {
+            "rows": int(len(out)),
+            "coins": int(out["coin_id"].nunique()) if "coin_id" in out else -1,
+            "asof_distinct": int(out["asof_ts"].nunique()) if "asof_ts" in out else -1,
+        },
+    )
+    # endregion
     out["asof_ts"] = pd.to_datetime(out["asof_ts"], utc=True)
     out["price"] = pd.to_numeric(out["price"], errors="coerce")
     out = out.dropna(subset=["asof_ts", "price"])
@@ -93,7 +165,61 @@ def _prepare_line_chart_wide(df: pd.DataFrame) -> pd.DataFrame:
         wide.index = idx.tz_convert("UTC").tz_localize(None)
     wide.index.name = "asof_ts_utc"
     wide = wide.sort_index()
+    # region agent log
+    _debug_log(
+        "H2",
+        "services/ui/app.py:_prepare_line_chart_wide",
+        "output_from_prepare_line_chart",
+        {
+            "rows": int(len(wide)),
+            "cols": int(len(wide.columns)),
+            "index_distinct": int(wide.index.nunique()) if len(wide) > 0 else 0,
+        },
+    )
+    # endregion
     return wide
+
+
+def _prepare_coin_chart_frame(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    out["asof_ts"] = pd.to_datetime(out["asof_ts"], utc=True)
+    out["price"] = pd.to_numeric(out["price"], errors="coerce")
+    out = out.dropna(subset=["asof_ts", "price"]).sort_values("asof_ts")
+    if out.empty:
+        return pd.DataFrame(columns=["asof_ts", "price"])
+    idx = pd.DatetimeIndex(out["asof_ts"])
+    if getattr(idx, "tz", None) is not None:
+        out["asof_ts"] = idx.tz_convert("UTC").tz_localize(None)
+    return out[["asof_ts", "price"]]
+
+
+def _render_coin_chart(df: pd.DataFrame, height: int = 260) -> None:
+    if df.empty:
+        st.warning("No chartable data.")
+        return
+    y_min = float(df["price"].min())
+    y_max = float(df["price"].max())
+    if y_min == y_max:
+        pad = max(abs(y_min) * 0.01, 1e-6)
+    else:
+        pad = (y_max - y_min) * 0.05
+    domain_min = y_min - pad
+    domain_max = y_max + pad
+    chart = (
+        alt.Chart(df)
+        .mark_line()
+        .encode(
+            x=alt.X("asof_ts:T", title="Time (UTC)"),
+            y=alt.Y(
+                "price:Q",
+                title="Price",
+                scale=alt.Scale(domain=[domain_min, domain_max], nice=False, zero=False),
+            ),
+            tooltip=[alt.Tooltip("asof_ts:T", title="Time"), alt.Tooltip("price:Q", title="Price")],
+        )
+        .properties(height=height)
+    )
+    st.altair_chart(chart, use_container_width=True)
 
 
 def _live_snapshot_df() -> pd.DataFrame | None:
@@ -160,20 +286,56 @@ def main() -> None:
     with tab_charts:
         st.subheader("Price history (USD)")
         if chart_df is not None and not chart_df.empty:
+            # region agent log
+            _debug_log(
+                "H3",
+                "services/ui/app.py:main.tab_charts",
+                "chart_df_present",
+                {
+                    "rows": int(len(chart_df)),
+                    "coins": int(chart_df["coin_id"].nunique()) if "coin_id" in chart_df else -1,
+                    "asof_distinct": int(chart_df["asof_ts"].nunique()) if "asof_ts" in chart_df else -1,
+                },
+            )
+            # endregion
             coins = sorted(chart_df["coin_id"].dropna().unique().tolist())
-            pick = st.multiselect("Coins", coins, default=coins[: min(5, len(coins))])
-            sub = chart_df[chart_df["coin_id"].isin(pick)] if pick else chart_df
-            wide = _prepare_line_chart_wide(sub)
-            if wide.empty:
-                st.warning("Price series empty after cleaning; check warehouse data.")
-            else:
-                st.line_chart(wide, height=420)
-                with st.expander("Chart source (rows used)"):
-                    st.caption(
-                        "Uses `silver_price_ticks` when present; otherwise deduped `bronze_price_ticks`."
+            # Show one chart per coin so each chart has its own y-axis scale.
+            cols = st.columns(2)
+            for i, coin in enumerate(coins):
+                with cols[i % 2]:
+                    st.markdown(f"**{coin.upper()}**")
+                    coin_df = chart_df[chart_df["coin_id"] == coin].copy()
+                    # region agent log
+                    _debug_log(
+                        "H4",
+                        "services/ui/app.py:main.tab_charts",
+                        "per_coin_chart_subset",
+                        {
+                            "coin": coin,
+                            "rows": int(len(coin_df)),
+                            "asof_distinct": int(coin_df["asof_ts"].nunique()) if "asof_ts" in coin_df else -1,
+                        },
                     )
-                    st.dataframe(sub.sort_values(["asof_ts", "coin_id"]), use_container_width=True)
+                    # endregion
+                    chart_points = _prepare_coin_chart_frame(coin_df)
+                    if chart_points.empty:
+                        st.warning(f"No chartable data for {coin}.")
+                    else:
+                        _render_coin_chart(chart_points, height=260)
+            with st.expander("Chart source (rows used)"):
+                st.caption(
+                    "Uses `silver_price_ticks` when present; otherwise deduped `bronze_price_ticks`."
+                )
+                st.dataframe(chart_df.sort_values(["asof_ts", "coin_id"]), use_container_width=True)
         else:
+            # region agent log
+            _debug_log(
+                "H3",
+                "services/ui/app.py:main.tab_charts",
+                "chart_df_missing_or_empty",
+                {"is_none": chart_df is None},
+            )
+            # endregion
             st.warning(
                 "No price history in the warehouse yet. Run the collector, or use the live snapshot below."
             )

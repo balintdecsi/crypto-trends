@@ -80,7 +80,7 @@ def load_collector_config(environ: dict[str, str] | None = None) -> CollectorCon
     vs_currency = env.get("VS_CURRENCY", "usd").strip() or "usd"
     duckdb_path = env.get("DUCKDB_PATH", "/data/warehouse.duckdb").strip() or "/data/warehouse.duckdb"
 
-    coins_env = env.get("COINS", "bitcoin:btc,ethereum:eth")
+    coins_env = env.get("COINS", "bitcoin:btc,ethereum:eth,solana:sol,cardano:ada")
     coins = _parse_coins(coins_env)
 
     if not coins:

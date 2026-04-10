@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import json
 import os
 import sys
 import time
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import pandas as pd
 
@@ -18,6 +20,37 @@ from packages.common.providers.coingecko import CoinGeckoClient  # noqa: E402
 
 # CoinGecko demo tier: avoid burst limits when requesting one chart per coin.
 _INTER_COIN_DELAY_S = 1.2
+
+
+def _debug_log(hypothesis_id: str, location: str, message: str, data: dict) -> None:
+    # region agent log
+    try:
+        log_path = "/home/balintdecsi/repos/.cursor/debug-babcd5.log"
+        Path(log_path).parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "sessionId": "babcd5",
+            "runId": "collector-pre-fix",
+            "hypothesisId": hypothesis_id,
+            "location": location,
+            "message": message,
+            "data": data,
+            "timestamp": int(datetime.now(timezone.utc).timestamp() * 1000),
+            "id": f"log_{uuid.uuid4().hex[:12]}",
+        }
+        line = json.dumps(payload, separators=(",", ":")) + "\n"
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(line)
+        # Also write to mounted data path for dockerized runs.
+        for extra_path in ("/data/debug-babcd5.log", "data/debug-babcd5.log"):
+            try:
+                Path(extra_path).parent.mkdir(parents=True, exist_ok=True)
+                with open(extra_path, "a", encoding="utf-8") as ef:
+                    ef.write(line)
+            except Exception:
+                pass
+    except Exception:
+        pass
+    # endregion
 
 
 @dataclass(frozen=True)
@@ -146,6 +179,43 @@ def _rows_from_market_chart_24h(
     return rows
 
 
+def _needs_recent_history_backfill(con, cfg: CollectorConfig, now_utc: datetime) -> bool:
+    """
+    Decide whether we should seed recent history even when bronze isn't empty.
+
+    If there are no rows in the last 24 hours for configured coins, or if each coin has too few
+    distinct timestamps, charts appear flat/constant. In that case, run market_chart backfill.
+    """
+    coin_ids = [cid for cid, _ in cfg.coins]
+    if not coin_ids:
+        return False
+    lookback_start = now_utc - timedelta(hours=24)
+    placeholders = ",".join(["?"] * len(coin_ids))
+    stats = con.execute(
+        f"""
+        SELECT
+            coin_id,
+            COUNT(*) AS n_rows,
+            COUNT(DISTINCT asof_ts) AS n_distinct_asof
+        FROM {BRONZE_TICKS_TABLE}
+        WHERE coin_id IN ({placeholders})
+          AND asof_ts IS NOT NULL
+          AND asof_ts >= ?
+        GROUP BY coin_id
+        """,
+        [*coin_ids, lookback_start],
+    ).fetchall()
+    if not stats:
+        return True
+    by_coin = {row[0]: int(row[2]) for row in stats}
+    # 24h @ 15m gives ~96 points; require at least a few points to avoid flat lines.
+    min_points_for_ok_chart = 4
+    for cid in coin_ids:
+        if by_coin.get(cid, 0) < min_points_for_ok_chart:
+            return True
+    return False
+
+
 def run_once(cfg: CollectorConfig) -> int:
     symbols = {cid: sym for cid, sym in cfg.coins}
 
@@ -155,16 +225,43 @@ def run_once(cfg: CollectorConfig) -> int:
     if cfg.provider != "coingecko":
         raise ValueError(f"Unsupported PROVIDER={cfg.provider!r}. Only 'coingecko' is implemented.")
 
+    # region agent log
+    _debug_log(
+        "H5",
+        "services/collector/app.py:run_once",
+        "collector_config",
+        {
+            "coins": [cid for cid, _ in cfg.coins],
+            "vs_currency": cfg.vs_currency,
+            "initial_backfill_days": int(cfg.initial_backfill_days),
+            "initial_backfill_interval_minutes": int(cfg.initial_backfill_interval_minutes),
+            "skip_initial_backfill": bool(cfg.skip_initial_backfill),
+        },
+    )
+    # endregion
+
     client = CoinGeckoClient(cfg.coingecko_base_url)
 
     con = connect_duckdb(cfg.duckdb_path)
     try:
         ensure_bronze_schema(con)
         bronze_count = con.execute(f"SELECT COUNT(*) FROM {BRONZE_TICKS_TABLE}").fetchone()[0]
+        needs_history_backfill = _needs_recent_history_backfill(con, cfg, ingested_at)
         use_initial_backfill = (
-            int(bronze_count) == 0
-            and not cfg.skip_initial_backfill
+            int(bronze_count) == 0 or needs_history_backfill
+        ) and not cfg.skip_initial_backfill
+        # region agent log
+        _debug_log(
+            "H6",
+            "services/collector/app.py:run_once",
+            "load_mode_decision",
+            {
+                "bronze_count": int(bronze_count),
+                "needs_history_backfill": bool(needs_history_backfill),
+                "use_initial_backfill": bool(use_initial_backfill),
+            },
         )
+        # endregion
 
         if use_initial_backfill:
             rows = _rows_from_market_chart_24h(
@@ -181,6 +278,17 @@ def run_once(cfg: CollectorConfig) -> int:
             load_mode = "simple_price_snapshot"
 
         _validate_rows(rows)
+        # region agent log
+        per_coin_counts: dict[str, int] = {}
+        for r in rows:
+            per_coin_counts[r.coin_id] = per_coin_counts.get(r.coin_id, 0) + 1
+        _debug_log(
+            "H7",
+            "services/collector/app.py:run_once",
+            "rows_per_coin_before_insert",
+            {"rows_total": int(len(rows)), "rows_per_coin": per_coin_counts},
+        )
+        # endregion
 
         con.executemany(
             f"""
